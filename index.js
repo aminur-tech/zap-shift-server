@@ -1,6 +1,9 @@
 const express = require('express')
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const cors = require('cors')
+const helmet = require('helmet')
+const rateLimit = require('express-rate-limit')
+const { escapeSearchText, isValidTrackingNumber, parseBearerToken } = require('./utils/request-security')
 require('dotenv').config();
 const app = express()
 const port = process.env.PORT || 3000;
@@ -15,7 +18,10 @@ function generateTrackingId() {
 
 // firebase verify 
 const admin = require("firebase-admin");
-const serviceAccount = require('./zab-shift-firebase-adminsdk-fbsvc-a62efd09f0.json');
+// const serviceAccount = require('./zab-shift-firebase-adminsdk-fbsvc-a62efd09f0.json');
+const { count } = require('console');
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8')
+const serviceAccount = JSON.parse(decoded);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -23,19 +29,42 @@ admin.initializeApp({
 
 
 // middleware
-app.use(express.json())
-app.use(cors())
+const allowedOrigins = (process.env.CORS_ORIGINS || process.env.SITE_DOMAIN || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean)
+
+app.use((req, res, next) => {
+  req.requestId = crypto.randomUUID()
+  res.setHeader('x-request-id', req.requestId)
+  next()
+})
+app.use(helmet())
+app.use(express.json({ limit: '100kb' }))
+app.use(cors({
+  origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin))
+}))
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false
+}))
+
+const trackingRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 60,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false
+})
 
 const verifyFBToken = async (req, res, next) => {
-  // console.log('verify', req.headers.authorization)
-  const token = req.headers.authorization
-  if (!token) {
-    return res.status(401).send({ message: 'unAuthorized access' })
+  const idToken = parseBearerToken(req.get('authorization'))
+  if (!idToken) {
+    return res.status(401).send({ message: 'unauthorized access' })
   }
   try {
-    const idToken = token.split(' ')[1]
     const decoded = await admin.auth().verifyIdToken(idToken)
-    console.log('decode in the token', decoded)
     req.decoded_email = decoded.email
     next()
   }
@@ -46,6 +75,10 @@ const verifyFBToken = async (req, res, next) => {
 }
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.f47fo9z.mongodb.net/?appName=Cluster0`;
+
+app.get('/health', (req, res) => {
+  res.status(200).send({ status: 'ok' })
+})
 
 app.get('/', (req, res) => {
   res.send('zap shift server')
@@ -61,15 +94,17 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    await client.connect();
+    // await client.connect();
 
     const db = client.db('Zab-Shift')
     const userConnection = db.collection('users')
     const parcelConnection = db.collection('parcels')
     const paymentConnection = db.collection('payment')
     const riderConnection = db.collection('rider')
+    const trackingConnection = db.collection('tracking')
 
-    // verify with more database access 
+
+    // verify with more database access with admin
     const verifyAdmin = async (req, res, next) => {
       const email = req.decoded_email
       const query = { email }
@@ -78,19 +113,51 @@ async function run() {
         return res.status(403).send({ message: 'forbidden access' })
       }
       next()
+    }
+    // verify with more database access 
+    const verifyRider = async (req, res, next) => {
+      const email = req.decoded_email
+      const query = { email }
+      const user = await userConnection.findOne(query)
+      if (!user || user.role !== 'rider') {
+        return res.status(403).send({ message: 'forbidden access' })
+      }
+      next()
+    }
+
+    // tracking check
+    const logTracking = async (trackingId, status) => {
+      const log = {
+        trackingId,
+        status,
+        details: status.split('-').join(' '),
+        createAt: new Date()
+      }
+      const result = await trackingConnection.insertOne(log)
+      return result;
 
     }
 
+    const riderStatusTransitions = {
+      'delivery-assigned': ['rider_arriving', 'rider-arriving', 'parcel-delivered', 'delivery-failed'],
+      'rider_arriving': ['parcel-delivered', 'delivery-failed'],
+      'rider-arriving': ['parcel-delivered', 'delivery-failed']
+    }
 
     // user related api
     app.get('/users', verifyFBToken, async (req, res) => {
       const searchText = req.query.searchText
       const query = {}
+      const requestingUser = await userConnection.findOne({ email: req.decoded_email })
+      if (requestingUser?.role !== 'admin') {
+        query.email = req.decoded_email
+      }
       if (searchText) {
+        const safeSearchText = escapeSearchText(searchText)
         // query.displayName = {$regex:searchText, $options:'i'}
         query.$or = [
-          { displayName: { $regex: searchText, $options: 'i' } },
-          { email: { $regex: searchText, $options: 'i' } },
+          { displayName: { $regex: safeSearchText, $options: 'i' } },
+          { email: { $regex: safeSearchText, $options: 'i' } },
         ]
       }
 
@@ -99,15 +166,22 @@ async function run() {
       res.send(result)
     })
 
-    app.get('/users/:email/role', async (req, res) => {
+    app.get('/users/:email/role', verifyFBToken, async (req, res) => {
       const email = req.params.email
+      if (email !== req.decoded_email) {
+        const requestingUser = await userConnection.findOne({ email: req.decoded_email })
+        if (requestingUser?.role !== 'admin') {
+          return res.status(403).send({ message: 'forbidden access' })
+        }
+      }
       const query = { email }
       const user = await userConnection.findOne(query)
       res.send({ role: user?.role || 'user' })
     })
 
-    app.post('/users', async (req, res) => {
+    app.post('/users', verifyFBToken, async (req, res) => {
       const user = req.body;
+      user.email = req.decoded_email
       user.role = 'user'
       user.createAt = new Date()
 
@@ -139,12 +213,16 @@ async function run() {
     // =======================
     //      GET PARCELS
     // =======================
-    app.get('/parcels', async (req, res) => {
+    app.get('/parcels', verifyFBToken, async (req, res) => {
       const query = {}
       const { email, delivery_status } = req.query
 
-      if (email) {
-        query.senderEmail = email
+      const requestingUser = await userConnection.findOne({ email: req.decoded_email })
+      if (requestingUser?.role !== 'admin') {
+        if (email && email !== req.decoded_email) {
+          return res.status(403).send({ message: 'forbidden access' })
+        }
+        query.senderEmail = req.decoded_email
       }
 
       if (delivery_status) {
@@ -156,24 +234,157 @@ async function run() {
       res.send(result)
     })
 
+    app.get('/parcels/rider', verifyFBToken, verifyRider, async (req, res) => {
+      const { delivery_status } = req.query
+      const query = {}
+      query.riderEmail = req.decoded_email
+      if (delivery_status !== "parcel-delivered") {
+        query.delivery_status =
+          //  { $in: [ "delivery-assigned", "rider_arriving"]}
+          { $nin: ["parcel-delivered"] }
+      }
+      else {
+        query.delivery_status = delivery_status
+      }
+
+      const cursor = parcelConnection.find(query)
+      const result = await cursor.toArray()
+      res.send(result)
+    })
+
+
     // Get single parcel
-    app.get('/parcels/:id', async (req, res) => {
+    app.get('/parcels/:id', verifyFBToken, async (req, res) => {
       const id = req.params.id
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: 'invalid parcel id' })
+      }
+      const requestingUser = await userConnection.findOne({ email: req.decoded_email })
       const query = { _id: new ObjectId(id) }
+      if (requestingUser?.role !== 'admin') {
+        query.$or = [
+          { senderEmail: req.decoded_email },
+          { riderEmail: req.decoded_email }
+        ]
+      }
       const result = await parcelConnection.findOne(query)
+      if (!result) {
+        return res.status(404).send({ message: 'parcel not found' })
+      }
+      res.send(result)
+    })
+
+    app.get('/parcels/delivery-status/stats', verifyFBToken, verifyAdmin, async (req, res) => {
+      const pipeline = [
+        {
+          $group: {
+            _id: "$delivery_status",
+            count: { $sum: 1 }
+          }
+        },
+        {
+          $project: {
+            status: '$_id',
+            count: 1
+          }
+        }
+      ]
+      const result = await parcelConnection.aggregate(pipeline).toArray()
       res.send(result)
     })
 
     // Add parcel
-    app.post('/parcels', async (req, res) => {
+    app.post('/parcels', verifyFBToken, async (req, res) => {
       const parcel = req.body
+      const trackingId = generateTrackingId()
       parcel.createAt = new Date()
+      parcel.senderEmail = req.decoded_email
+
+      parcel.trackingId = trackingId
+      logTracking(trackingId, 'parcel_created')
       const result = await parcelConnection.insertOne(parcel)
       res.send(result)
     })
 
+
+    app.patch('/parcels/:id', verifyFBToken, verifyAdmin, async (req, res) => {
+      const { riderId, riderName, riderEmail, trackingId } = req.body
+      const id = req.params.id
+      const query = { _id: new ObjectId(id) }
+      const updateDoc = {
+        $set: {
+          delivery_status: 'delivery-assigned',
+          riderId: riderId,
+          riderName: riderName,
+          riderEmail: riderEmail
+        }
+      }
+      const result = await parcelConnection.updateOne(query, updateDoc)
+
+      // update rider info
+      const riderQuery = { _id: new ObjectId(riderId) }
+      const RiderUpdatedDoc = {
+        $set: {
+          workStatus: 'in-delivery'
+        }
+      }
+      const riderResult = await riderConnection.updateOne(riderQuery, RiderUpdatedDoc)
+
+      // log tracking
+      logTracking(trackingId, "delivery-assigned")
+      res.send(riderResult)
+    })
+
+
+
+    // accept delivery
+    app.patch('/parcels/:id/status', verifyFBToken, verifyRider, async (req, res) => {
+      const { delivery_status } = req.body;
+      if (!ObjectId.isValid(req.params.id) || typeof delivery_status !== 'string') {
+        return res.status(400).send({ message: 'invalid parcel status request' })
+      }
+      const query = {
+        _id: new ObjectId(req.params.id),
+        riderEmail: req.decoded_email
+      };
+      const parcel = await parcelConnection.findOne(query)
+      if (!parcel) {
+        return res.status(404).send({ message: 'assigned parcel not found' })
+      }
+      const nextStatuses = riderStatusTransitions[parcel.delivery_status] || []
+      if (!nextStatuses.includes(delivery_status)) {
+        return res.status(409).send({ message: 'invalid parcel status transition' })
+      }
+
+      let rider
+      if (delivery_status === 'parcel-delivered') {
+        rider = await riderConnection.findOne({ email: req.decoded_email })
+        if (!rider) {
+          return res.status(403).send({ message: 'rider profile not found' })
+        }
+      }
+
+      const updateQuery = { ...query, delivery_status: parcel.delivery_status }
+      const updatedDoc = { $set: { delivery_status } };
+      const result = await parcelConnection.updateOne(updateQuery, updatedDoc)
+      if (result.matchedCount === 0) {
+        return res.status(409).send({ message: 'parcel assignment changed' })
+      }
+
+      if (delivery_status === 'parcel-delivered') {
+        const riderQuery = { _id: rider._id };
+        const RiderUpdatedDoc = { $set: { workStatus: 'available' } };
+        await riderConnection.updateOne(riderQuery, RiderUpdatedDoc);
+      }
+
+      await logTracking(parcel.trackingId, delivery_status);
+      res.send(result);
+    });
+
+
+
     // Delete parcel
-    app.delete('/parcels/:id', async (req, res) => {
+    app.delete('/parcels/:id', verifyFBToken, verifyAdmin, async (req, res) => {
       const id = req.params.id
       const query = { _id: new ObjectId(id) }
       const result = await parcelConnection.deleteOne(query)
@@ -185,9 +396,25 @@ async function run() {
     // ==============================
     //      CREATE CHECKOUT SESSION
     // ==============================
-    app.post('/create-checkout-session', async (req, res) => {
+    app.post('/create-checkout-session', verifyFBToken, async (req, res) => {
       const paymentInfo = req.body
-      const amount = parseInt(paymentInfo.cost) * 100
+      if (!ObjectId.isValid(paymentInfo.parcelId)) {
+        return res.status(400).send({ message: 'invalid parcel id' })
+      }
+
+      const parcel = await parcelConnection.findOne({ _id: new ObjectId(paymentInfo.parcelId) })
+      if (!parcel) {
+        return res.status(404).send({ message: 'parcel not found' })
+      }
+      if (parcel.senderEmail !== req.decoded_email) {
+        return res.status(403).send({ message: 'forbidden access' })
+      }
+
+      const amount = Math.round(Number(parcel.cost) * 100)
+      if (!Number.isSafeInteger(amount) || amount <= 0) {
+        return res.status(400).send({ message: 'parcel has an invalid delivery cost' })
+      }
+      const parcelName = parcel.parcelName || parcel.name || 'Parcel delivery'
 
       const session = await stripe.checkout.sessions.create({
         line_items: [
@@ -196,7 +423,7 @@ async function run() {
               currency: 'USD',
               unit_amount: amount,
               product_data: {
-                name: paymentInfo.parcelName
+                name: parcelName
               }
             },
             quantity: 1,
@@ -204,13 +431,15 @@ async function run() {
         ],
 
         // Stripe will email receipt
-        customer_email: paymentInfo.senderEmail,
+        customer_email: req.decoded_email,
         mode: 'payment',
 
         // ✅ FIXED: metadata MUST BE AT ROOT LEVEL
         metadata: {
-          parcelId: paymentInfo.parcelId,
-          parcelName: paymentInfo.parcelName
+          parcelId: parcel._id.toString(),
+          parcelName,
+          trackingId: parcel.trackingId
+
         },
 
         success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
@@ -240,8 +469,8 @@ async function run() {
         })
       }
 
-
-      const trackingId = generateTrackingId()
+      // previous trackingId
+      const trackingId = session.metadata.trackingId
 
       if (session.payment_status === 'paid') {
         const id = session.metadata.parcelId;
@@ -272,7 +501,8 @@ async function run() {
 
         if (session.payment_status === 'paid') {
           const paymentResult = await paymentConnection.insertOne(payment)
-          res.send({
+          logTracking(trackingId, "pending-pickup")
+          return res.send({
             success: true,
             modifyParcel: result,
             paymentInfo: paymentResult,
@@ -281,21 +511,22 @@ async function run() {
           })
         }
       }
-      res.send({ success: false })
+      return res.send({ success: false })
     });
 
 
     //  payment related apl
     app.get('/payments', verifyFBToken, async (req, res) => {
       const email = req.query.email
-      // console.log('headers', req.headers)
       const query = {}
-      if (email) {
-        query.customer_email = email
-        // check valid email
-        if (email !== req.decoded_email) {
+      const requestingUser = await userConnection.findOne({ email: req.decoded_email })
+      if (requestingUser?.role !== 'admin') {
+        if (email && email !== req.decoded_email) {
           return res.status(403).send({ message: 'forbidden access' })
         }
+        query.customer_email = req.decoded_email
+      } else if (email) {
+        query.customer_email = email
       }
       const cursor = paymentConnection.find(query).sort({ paidAt: -1 })
       const result = await cursor.toArray()
@@ -304,7 +535,7 @@ async function run() {
 
 
     // rider related api
-    app.get('/riders', async (req, res) => {
+    app.get('/riders', verifyFBToken, verifyAdmin, async (req, res) => {
       const { status, district, workStatus } = req.query
       const query = {}
       if (status) {
@@ -321,8 +552,33 @@ async function run() {
       res.send(result)
     })
 
-    app.post('/riders', async (req, res) => {
+    // app.get('/riders/delivery-per-day', async (req, res) => {
+    //   const email = req.query.email
+    //   // rider aggregate
+    //   const pipeline = [
+    //     {
+    //       $match: {
+    //         riderEmail: email,
+    //         delivery_status: "parcel-delivered"
+    //       }
+    //     },
+    //     {
+    //       $lookup: {
+    //         from: 'tracking',
+    //         localField: 'trackingId',
+    //         foreignField: 'trackingId',
+            
+    //       }
+    //     }
+
+    //   ]
+    //   const result = await parcelConnection.aggregate(pipeline).toArray()
+    //   res.send(result)
+    // })
+
+    app.post('/riders', verifyFBToken, async (req, res) => {
       const rider = req.body
+      rider.email = req.decoded_email
       rider.status = 'pending'
       rider.createAt = new Date()
 
@@ -357,46 +613,60 @@ async function run() {
       res.send(result);
     })
 
-    app.patch('/parcels/:id', async (req, res) => {
-      const { riderId, riderName, riderEmail } = req.body
-      const id = req.params.id
-      const query = { _id: new ObjectId(id) }
-      const updateDoc = {
-        $set: {
-          delivery_status: 'delivery-assigned',
-          riderId: riderId,
-          riderName: riderName,
-          riderEmail: riderEmail
-        }
-      }
-      const result = await parcelConnection.updateOne(query, updateDoc)
-
-      // update rider info
-      const riderQuery = { _id: new ObjectId(riderId) }
-      const RiderUpdatedDoc = {
-        $set: {
-          workStatus: 'in-delivery'
-        }
-      }
-      const riderResult = await riderConnection.updateOne(riderQuery, RiderUpdatedDoc)
-      res.send(riderResult)
-    })
-
 
     // delete riders
-    app.delete('/riders/:id', async (req, res) => {
+    app.delete('/riders/:id', verifyFBToken, verifyAdmin, async (req, res) => {
       const id = req.params.id
       const result = await riderConnection.deleteOne({ _id: new ObjectId(id) })
       res.send(result)
 
     })
 
+    // tracking related api
+    app.get('/tracking/:trackingId/logs', trackingRateLimit, async (req, res) => {
+      const trackingId = req.params.trackingId
+      if (!isValidTrackingNumber(trackingId)) {
+        return res.status(400).send({ message: 'invalid tracking number' })
+      }
+      const query = { trackingId }
+      const result = await trackingConnection.find(query, {
+        projection: {
+          _id: 0,
+          trackingId: 1,
+          status: 1,
+          details: 1,
+          createAt: 1
+        }
+      }).toArray()
+      res.send(result)
+    })
 
+    app.use((req, res) => {
+      res.status(404).send({ message: 'route not found' })
+    })
 
+    app.use((err, req, res, next) => {
+      const errorStatus = Number.isInteger(err.statusCode) ? err.statusCode : err.status
+      const statusCode = Number.isInteger(errorStatus) && errorStatus >= 400 && errorStatus < 600
+        ? errorStatus
+        : 500
 
+      if (statusCode >= 500) {
+        console.error(JSON.stringify({
+          level: 'error',
+          requestId: req.requestId,
+          error: err.message
+        }))
+      }
 
-    await client.db("admin").command({ ping: 1 });
-    console.log("Connected to MongoDB!");
+      res.status(statusCode).send({
+        message: statusCode < 500 ? 'Invalid request' : 'Internal server error',
+        requestId: req.requestId
+      })
+    })
+
+    // await client.db("admin").command({ ping: 1 });
+    // console.log("Connected to MongoDB!");
   } finally { }
 }
 
